@@ -32,43 +32,54 @@ version: 2.1
 #   requirement regardless, because pnpm-workspace.yaml uses the v11
 #   `allowBuilds` and `minimumReleaseAge` keys.
 #
-# RESOURCE CLASS — xlarge (8 vCPU / 16 GB)
+# RESOURCE CLASS — large (4 vCPU / 8 GB)
 #
-#   This is the one setting that was actually tuned against real runs rather
-#   than reasoned about, so here is the history.
+#   This is the one setting that was tuned against real runs rather than
+#   reasoned about, so here is the history — including the two things that did
+#   not work, so nobody re-tries them.
 #
 #   The repo's own scripts ask for `turbo --concurrency 16` on both build and
 #   test, and each of the 80 packages runs Vitest twice (a node config and an
 #   edge-runtime config). Vitest sizes its own worker pool from
 #   os.availableParallelism(), which *does* correctly report the container's
 #   CPU quota. So the job's real fan-out is roughly
-#   (16 packages in flight) x (one worker per vCPU) — always about 16x more
-#   runnable workers than vCPUs, at any resource class.
+#   (16 packages in flight) x (one worker per vCPU) — about 16x more runnable
+#   workers than vCPUs, and that ratio does not change with resource class.
 #
-#   That oversubscription matters because a handful of suites here sit within a
-#   few hundred milliseconds of Vitest's default 5 s per-test timeout, and they
-#   are dominated by module *import* cost, not assertion cost: for
-#   @ai-sdk/gateway the edge run reports ~80 s of import against ~25 s of
-#   actual test time. The tests that tip over are the ones whose first
-#   statement is a cold dynamic `await import(...)`, which pays transform cost
-#   inside its own 5 s budget. Two of them have been observed failing purely on
-#   timeout, with no assertion error:
+#   `medium` (2 vCPU / 4 GB) is too small for that fan-out. `large` passes
+#   install + build + the full suite in ~15 min (install 85 s, build ~4 min,
+#   test ~8.5 min) and is what this job uses.
+#
+#   Two attempts to widen the margin, both rejected:
+#
+#     1. VITEST_MAX_WORKERS=2, to cut the oversubscription. Reverted: it
+#        measurably did not help. @ai-sdk/gateway's node run took 50.68 s
+#        uncapped vs 51.07 s capped, and the capped run still timed out. These
+#        suites are import/transform-bound rather than assertion-bound — the
+#        gateway edge run reports ~80 s of import against ~25 s of test time —
+#        so fewer workers per package just moves the same transform work onto
+#        fewer threads.
+#     2. resource_class: xlarge, to throw absolute CPU at the transform phase.
+#        Rejected by the scheduler on this account's plan: the job failed in
+#        under a second with "Task information unavailable" and produced no
+#        step logs at all. If your plan does grant xlarge it is worth trying,
+#        since absolute CPU is the lever that actually applies here.
+#
+#   KNOWN RESIDUAL FLAKE. A handful of suites sit within a few hundred
+#   milliseconds of Vitest's default 5 s per-test timeout, specifically the
+#   ones whose first statement is a cold dynamic `await import(...)` and so pay
+#   transform cost inside their own 5 s budget. Two have been seen failing
+#   purely on timeout, with no assertion error:
 #     * @ai-sdk/google  "uses a resumable file upload when the creation body
 #       reaches 20 MB" (allocates and JSON-encodes 20 MB several times)
 #     * @ai-sdk/gateway "rejects minting (getToken) in browsers — the
 #       credential must stay server-side"
-#
-#   `large` (4 vCPU / 8 GB) does pass, but with little margin. An attempt to
-#   fix the margin by capping Vitest's pool (VITEST_MAX_WORKERS=2) was reverted
-#   because it measurably did not help: @ai-sdk/gateway's node run took 50.68 s
-#   uncapped vs 51.07 s capped, and the capped run still timed out. Fewer
-#   workers per package just moves the same transform work onto fewer threads.
-#
-#   So the lever that actually applies is absolute CPU, not the worker ratio:
-#   `xlarge` doubles the cores available to the transform/import phase while
-#   keeping memory-per-worker the same as the configuration that already
-#   passed. If you need to cut spend, `large` is the documented fallback —
-#   expect the occasional timeout flake in the two suites named above.
+#   If either starts failing regularly, the lever that has not been tried is
+#   lowering turbo's own fan-out so fewer packages compete for the 4 vCPUs —
+#   replace the test command with
+#   `pnpm exec turbo test --concurrency 6 --filter=!@example/*`. That trades
+#   wall-clock for CPU share per worker. Raising the timeout would mean editing
+#   the packages' Vitest configs, which is a source change, not a CI change.
 #
 # INSTALL — circleci/setup-node, no flags
 #
@@ -146,7 +157,7 @@ jobs:
   build-and-test:
     docker:
       - image: cimg/node:22.23.2
-    resource_class: xlarge
+    resource_class: large
     environment:
       SKIP_RSC_E2E: '1'
       TURBO_TELEMETRY_DISABLED: '1'
