@@ -41,6 +41,26 @@ version: 2.1
 #   running out of memory. `large` (4 vCPU / 8 GB) is the smallest class that
 #   gives the build real parallelism without over-provisioning.
 #
+# VITEST_MAX_WORKERS=2
+#
+#   This one is not cosmetic, so it is worth the paragraph. Vitest sizes its
+#   worker pool from Node's view of the machine, and inside a CircleCI Docker
+#   container Node reports the *host's* CPU count rather than the container's
+#   cgroup quota — the "Report toolchain versions" step below prints both
+#   numbers so the discrepancy is visible in every job's log. Multiply that
+#   by turbo running 16 package test scripts at once and the job asks for
+#   vastly more runnable workers than it has vCPUs.
+#
+#   That matters here because several suites in this repo sit close to Vitest's
+#   default 5 s per-test timeout. The clearest example is
+#   @ai-sdk/google's "uses a resumable file upload when the creation body
+#   reaches 20 MB", which allocates and JSON-encodes a 20 MB payload several
+#   times over; on a contended machine it takes >7 s and fails on timeout, not
+#   on a real assertion. Capping each package's pool at 2 workers keeps total
+#   fan-out proportional to the 4 vCPUs the job actually has, which trades a
+#   little wall-clock for not having CPU contention masquerade as a test
+#   failure.
+#
 # INSTALL — circleci/setup-node, no flags
 #
 #   Every flag this function takes is already correct by default for this repo,
@@ -119,6 +139,7 @@ jobs:
       SKIP_RSC_E2E: '1'
       TURBO_TELEMETRY_DISABLED: '1'
       DO_NOT_TRACK: '1'
+      VITEST_MAX_WORKERS: '2'
     steps:
       - checkout
 
@@ -129,8 +150,13 @@ jobs:
       - run:
           name: Report toolchain versions
           command: |
-            echo "node:  $(node --version)"
-            echo "pnpm:  $(pnpm --version)"
+            echo "node:                        $(node --version)"
+            echo "pnpm:                        $(pnpm --version)"
+            # nproc honours the container's CPU quota; os.availableParallelism()
+            # generally does not. The gap is why VITEST_MAX_WORKERS is pinned.
+            echo "nproc (container quota):     $(nproc)"
+            echo "os.availableParallelism():   $(node -e 'console.log(require("node:os").availableParallelism())')"
+            echo "os.cpus().length:            $(node -e 'console.log(require("node:os").cpus().length)')"
 
       - run:
           name: Build packages
