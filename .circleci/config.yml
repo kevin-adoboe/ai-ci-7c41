@@ -9,10 +9,10 @@ version: 2.1
 #   The root package.json pins `"engines": { "node": "^22.13.0 || ^24.0.0 ||
 #   ^26.0.0" }`, and CONTRIBUTING.md tells contributors to install Node v22.13,
 #   v24, or v26. Note that this rules out the `cimg/node:22.4` used in the
-#   circleci/setup-node README example: 22.4 < 22.13, so a frozen pnpm install
-#   would trip the engines check. We use the Node 22 line because it is the
-#   active LTS and the *lowest* line this repo supports — building and testing
-#   on the floor is what catches accidental use of Node-24-only APIs.
+#   circleci/setup-node README example: 22.4 < 22.13. We use the Node 22 line
+#   because it is the active LTS and the *lowest* line this repo supports —
+#   building and testing on the floor is what catches accidental use of
+#   Node-24-only APIs.
 #
 #   The tag is pinned to an exact patch (22.23.2, the newest cimg/node 22.x)
 #   rather than the floating `22` or `22.23` tags, so a re-run six months from
@@ -32,34 +32,43 @@ version: 2.1
 #   requirement regardless, because pnpm-workspace.yaml uses the v11
 #   `allowBuilds` and `minimumReleaseAge` keys.
 #
-# RESOURCE CLASS — large
+# RESOURCE CLASS — xlarge (8 vCPU / 16 GB)
 #
-#   This is an 80-package monorepo, and the repo's own scripts ask for
-#   `turbo --concurrency 16` on both build and test, with each package running
-#   Vitest twice (node + edge environments). On the default `medium`
-#   (2 vCPU / 4 GB) that fan-out both serialises badly and risks the container
-#   running out of memory. `large` (4 vCPU / 8 GB) is the smallest class that
-#   gives the build real parallelism without over-provisioning.
+#   This is the one setting that was actually tuned against real runs rather
+#   than reasoned about, so here is the history.
 #
-# VITEST_MAX_WORKERS=2
+#   The repo's own scripts ask for `turbo --concurrency 16` on both build and
+#   test, and each of the 80 packages runs Vitest twice (a node config and an
+#   edge-runtime config). Vitest sizes its own worker pool from
+#   os.availableParallelism(), which *does* correctly report the container's
+#   CPU quota. So the job's real fan-out is roughly
+#   (16 packages in flight) x (one worker per vCPU) — always about 16x more
+#   runnable workers than vCPUs, at any resource class.
 #
-#   This one is not cosmetic, so it is worth the paragraph. Vitest sizes its
-#   worker pool from Node's view of the machine, and inside a CircleCI Docker
-#   container Node reports the *host's* CPU count rather than the container's
-#   cgroup quota — the "Report toolchain versions" step below prints both
-#   numbers so the discrepancy is visible in every job's log. Multiply that
-#   by turbo running 16 package test scripts at once and the job asks for
-#   vastly more runnable workers than it has vCPUs.
+#   That oversubscription matters because a handful of suites here sit within a
+#   few hundred milliseconds of Vitest's default 5 s per-test timeout, and they
+#   are dominated by module *import* cost, not assertion cost: for
+#   @ai-sdk/gateway the edge run reports ~80 s of import against ~25 s of
+#   actual test time. The tests that tip over are the ones whose first
+#   statement is a cold dynamic `await import(...)`, which pays transform cost
+#   inside its own 5 s budget. Two of them have been observed failing purely on
+#   timeout, with no assertion error:
+#     * @ai-sdk/google  "uses a resumable file upload when the creation body
+#       reaches 20 MB" (allocates and JSON-encodes 20 MB several times)
+#     * @ai-sdk/gateway "rejects minting (getToken) in browsers — the
+#       credential must stay server-side"
 #
-#   That matters here because several suites in this repo sit close to Vitest's
-#   default 5 s per-test timeout. The clearest example is
-#   @ai-sdk/google's "uses a resumable file upload when the creation body
-#   reaches 20 MB", which allocates and JSON-encodes a 20 MB payload several
-#   times over; on a contended machine it takes >7 s and fails on timeout, not
-#   on a real assertion. Capping each package's pool at 2 workers keeps total
-#   fan-out proportional to the 4 vCPUs the job actually has, which trades a
-#   little wall-clock for not having CPU contention masquerade as a test
-#   failure.
+#   `large` (4 vCPU / 8 GB) does pass, but with little margin. An attempt to
+#   fix the margin by capping Vitest's pool (VITEST_MAX_WORKERS=2) was reverted
+#   because it measurably did not help: @ai-sdk/gateway's node run took 50.68 s
+#   uncapped vs 51.07 s capped, and the capped run still timed out. Fewer
+#   workers per package just moves the same transform work onto fewer threads.
+#
+#   So the lever that actually applies is absolute CPU, not the worker ratio:
+#   `xlarge` doubles the cores available to the transform/import phase while
+#   keeping memory-per-worker the same as the configuration that already
+#   passed. If you need to cut spend, `large` is the documented fallback —
+#   expect the occasional timeout flake in the two suites named above.
 #
 # INSTALL — circleci/setup-node, no flags
 #
@@ -71,8 +80,9 @@ version: 2.1
 #       install to point at.
 #     * the package manager is auto-detected from pnpm-lock.yaml, so
 #       `--package-manager pnpm` would just restate what the lockfile says.
-#     * --with-cache is on by default, which is what we want — the pnpm store
-#       is large and the cache key already busts on a lockfile change.
+#     * --with-cache is on by default, which is what we want — the restored
+#       pnpm store is ~1.2 GB and the cache key already busts on a lockfile
+#       change.
 #   Because the function owns the whole cache lifecycle internally, there are
 #   deliberately NO restore_cache / save_cache steps wrapped around it; the
 #   README calls that out explicitly and adding them would fight the function.
@@ -94,9 +104,10 @@ version: 2.1
 # TEST — `pnpm test`
 #
 #   `turbo test --concurrency 16 --filter=!@example/*`. Turbo's `test` task
-#   dependsOn `build`, but the build step above already populated the local
-#   turbo cache inside this same job, so the dependency replays from cache
-#   instead of rebuilding.
+#   dependsOn `build`, and because the build step above already populated the
+#   local turbo cache inside this same job, that dependency replays from cache
+#   instead of rebuilding — the test step's summary reads "160 successful,
+#   80 cached", i.e. 80 build tasks replayed plus 80 test tasks actually run.
 #
 #   Deliberately not `pnpm test:ci`: that variant additionally drops the `ai`
 #   and `@ai-sdk/codemod` packages (they are split into their own job in the
@@ -110,7 +121,8 @@ version: 2.1
 #   turbo.json declares it on the `test` task), because browser e2e needs the
 #   `-browsers` image plus `playwright install --with-deps` and a server
 #   warm-up — a different job's worth of setup. @ai-sdk/rsc's node, edge, and
-#   React UI Vitest suites all still run.
+#   React UI Vitest suites all still run. This is the one piece of the test
+#   suite this pipeline does not cover.
 #
 # TURBO_TELEMETRY_DISABLED / DO_NOT_TRACK
 #
@@ -134,12 +146,11 @@ jobs:
   build-and-test:
     docker:
       - image: cimg/node:22.23.2
-    resource_class: large
+    resource_class: xlarge
     environment:
       SKIP_RSC_E2E: '1'
       TURBO_TELEMETRY_DISABLED: '1'
       DO_NOT_TRACK: '1'
-      VITEST_MAX_WORKERS: '2'
     steps:
       - checkout
 
@@ -150,13 +161,16 @@ jobs:
       - run:
           name: Report toolchain versions
           command: |
-            echo "node:                        $(node --version)"
-            echo "pnpm:                        $(pnpm --version)"
-            # nproc honours the container's CPU quota; os.availableParallelism()
-            # generally does not. The gap is why VITEST_MAX_WORKERS is pinned.
-            echo "nproc (container quota):     $(nproc)"
-            echo "os.availableParallelism():   $(node -e 'console.log(require("node:os").availableParallelism())')"
-            echo "os.cpus().length:            $(node -e 'console.log(require("node:os").cpus().length)')"
+            echo "node:                      $(node --version)"
+            echo "pnpm:                      $(pnpm --version)"
+            # Worth knowing when reading a timeout failure: `nproc` and
+            # os.cpus() report the *host's* core count inside a CircleCI Docker
+            # container, while os.availableParallelism() reports the container's
+            # actual quota. Vitest sizes its worker pool from the latter, so
+            # this is the number that governs test parallelism.
+            echo "nproc (host):              $(nproc)"
+            echo "os.cpus().length (host):   $(node -e 'console.log(require("node:os").cpus().length)')"
+            echo "availableParallelism:      $(node -e 'console.log(require("node:os").availableParallelism())')"
 
       - run:
           name: Build packages
