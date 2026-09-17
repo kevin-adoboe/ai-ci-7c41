@@ -4,7 +4,14 @@ version: 2.1
 # Why this config looks the way it does
 # =============================================================================
 #
+# Install dependencies, build the publishable packages, run the Vitest suite —
+# on every push. The shape (two parallel test jobs rather than one) and most of
+# the tuning below came out of watching real runs fail, so the reasoning is
+# recorded here rather than rediscovered.
+#
+# -----------------------------------------------------------------------------
 # EXECUTOR IMAGE — cimg/node:22.23.2
+# -----------------------------------------------------------------------------
 #
 #   The root package.json pins `"engines": { "node": "^22.13.0 || ^24.0.0 ||
 #   ^26.0.0" }`, and CONTRIBUTING.md tells contributors to install Node v22.13,
@@ -20,7 +27,7 @@ version: 2.1
 #   as a deliberate config change instead of a mystery.
 #
 #   We use the plain variant, not `-browsers`. The only browser-driven suite in
-#   the repo is @ai-sdk/rsc's Playwright e2e, which this job skips (see
+#   the repo is @ai-sdk/rsc's Playwright e2e, which these jobs skip (see
 #   SKIP_RSC_E2E below), so the extra Chrome/Firefox/driver layers would be
 #   pulled on every job for nothing.
 #
@@ -28,109 +35,13 @@ version: 2.1
 #   workspace (pnpm-lock.yaml + pnpm-workspace.yaml, 80 packages). The repo
 #   pins `"packageManager": "pnpm@11.23.0"`, and pnpm >= 10 honours that field
 #   by default (manage-package-manager-versions), so the preinstalled binary
-#   hands off to exactly 11.23.0 — no corepack setup needed. pnpm 11 is a hard
-#   requirement regardless, because pnpm-workspace.yaml uses the v11
-#   `allowBuilds` and `minimumReleaseAge` keys.
+#   hands off to exactly 11.23.0 — confirmed in the job log, no corepack setup
+#   needed. pnpm 11 is a hard requirement regardless, because
+#   pnpm-workspace.yaml uses the v11 `allowBuilds` and `minimumReleaseAge` keys.
 #
-# RESOURCE CLASS — large (4 vCPU / 8 GB) + REDUCED TEST FAN-OUT
-#
-#   These two settings were tuned against real runs rather than reasoned
-#   about, so here is the history — including the things that did not work, so
-#   nobody re-tries them.
-#
-#   The repo's own scripts ask for `turbo --concurrency 16` on both build and
-#   test, and each of the 80 packages runs Vitest twice (a node config and an
-#   edge-runtime config). Vitest sizes its own worker pool from
-#   os.availableParallelism(), which *does* correctly report the container's
-#   CPU quota (the toolchain step below prints host vs container core counts,
-#   36 vs 4, so you can check this). So at the repo's default the job's real
-#   fan-out is about (16 packages in flight) x (4 workers) = ~64 Vitest
-#   workers sharing 4 vCPUs and 8 GB.
-#
-#   That default is tuned for a developer workstation and is too much for this
-#   container, in two different ways, both of which were observed:
-#
-#     * MEMORY. ~64 workers in 8 GB leaves ~128 MB each, and some suites need
-#       far more than that — packages/provider-utils' uint8-utils.node.test.ts
-#       deliberately spawns a subprocess to prove a 14 MB buffer encodes inside
-#       a 128 MiB heap. One run was OOM-killed outright: every test up to that
-#       point had passed, and the step ended with no error output, no turbo
-#       summary, and exit code unset (CircleCI reports it as `canceled`). That
-#       is the signature to look for if this comes back.
-#     * CPU. A handful of suites sit within a few hundred milliseconds of
-#       Vitest's default 5 s per-test timeout, specifically the ones whose
-#       first statement is a cold dynamic `await import(...)` and so pay module
-#       transform cost inside their own 5 s budget. These are import-bound, not
-#       assertion-bound: @ai-sdk/gateway's edge run reports ~80 s of import
-#       against ~25 s of actual test time. Two have been seen failing purely on
-#       timeout, with no assertion error:
-#         - @ai-sdk/google  "uses a resumable file upload when the creation
-#           body reaches 20 MB" (allocates and JSON-encodes 20 MB repeatedly)
-#         - @ai-sdk/gateway "rejects minting (getToken) in browsers — the
-#           credential must stay server-side"
-#
-#   Lowering turbo's concurrency for the test step is the one lever that fixes
-#   both at once: fewer packages in flight means fewer concurrent Vitest pools
-#   (less peak memory) *and* a bigger share of the 4 vCPUs for each worker
-#   (less starvation). At `--concurrency 6` the fan-out is ~24 workers, so
-#   ~330 MB and roughly 6x oversubscription instead of ~128 MB and 16x. It
-#   costs wall-clock, which is the right thing to trade for a suite that
-#   otherwise fails on contention rather than on code.
-#
-#   The build step keeps the repo's `--concurrency 16` (via
-#   `pnpm build:packages`): it has completed cleanly on every run so far
-#   (241 s / 274 s / 296 s), so there is nothing to buy by slowing it down.
-#
-#   Two other attempts, both rejected:
-#
-#     1. VITEST_MAX_WORKERS=2, capping each package's pool while leaving turbo
-#        at 16. Reverted: it measurably did not help the CPU problem.
-#        @ai-sdk/gateway's node run took 50.68 s uncapped vs 51.07 s capped,
-#        and the capped run still timed out. Capping workers per package moves
-#        the same transform work onto fewer threads within that package; it
-#        does not reduce how many packages are competing.
-#     2. resource_class: xlarge, to throw absolute CPU and RAM at the problem.
-#        Rejected by the scheduler on this account's plan — the job failed in
-#        under a second with "Task information unavailable" and produced no
-#        step logs at all. If your plan does grant xlarge, raising the class
-#        and restoring `pnpm test` is the better trade than slowing the fan-out.
-#
-#   If this job becomes the bottleneck, the next step is not more tuning: shard
-#   the packages across containers with CircleCI `parallelism` and split the
-#   turbo `--filter` per shard, rather than pushing a single container harder.
-#
-# THE TEST STEP RETRIES ONCE — and why that is not just papering over it
-#
-#   Lowering the fan-out fixed the OOM but not the 5 s timeouts, and the suite
-#   that tips over is different on every run. Three distinct tests have now
-#   been observed failing on timeout alone, never on an assertion:
-#
-#     * ai              "emits declarations for exported values with inferred
-#                        output types" — imports the whole TypeScript compiler
-#                        and runs a real declaration emit inside its 5 s budget
-#     * @ai-sdk/gateway "rejects minting (getToken) in browsers — the
-#                        credential must stay server-side" — opens with a cold
-#                        dynamic `await import(...)`
-#     * @ai-sdk/google  "uses a resumable file upload when the creation body
-#                        reaches 20 MB" — allocates and JSON-encodes 20 MB
-#                        several times over
-#
-#   These are load-sensitive, not broken: each one passes comfortably when the
-#   machine is not saturated. The clean fix would be a longer `testTimeout`,
-#   but that lives in each package's Vitest config, which is a source change
-#   spread across ~80 packages rather than a CI change — and turbo gives us a
-#   cheaper equivalent. Successful `test` tasks are cached (verified: a second
-#   invocation reports "cache hit, replaying logs"), so re-running the same
-#   turbo command re-executes *only* the packages that failed, which then get
-#   the container almost to themselves and comfortably beat the 5 s budget.
-#
-#   So the step runs the suite, and on failure runs it exactly once more. This
-#   absorbs a load-induced flake without hiding a real bug: a deterministic
-#   failure fails both attempts and the step still exits non-zero. It is
-#   bounded at one extra attempt deliberately — if a test fails twice, that is
-#   signal and the job should go red.
-#
+# -----------------------------------------------------------------------------
 # INSTALL — circleci/setup-node, no flags
+# -----------------------------------------------------------------------------
 #
 #   Every flag this function takes is already correct by default for this repo,
 #   so passing any of them would be noise:
@@ -140,9 +51,9 @@ version: 2.1
 #       install to point at.
 #     * the package manager is auto-detected from pnpm-lock.yaml, so
 #       `--package-manager pnpm` would just restate what the lockfile says.
-#     * --with-cache is on by default, which is what we want — the restored
-#       pnpm store is ~1.2 GB and the cache key already busts on a lockfile
-#       change.
+#     * --with-cache is on by default, which is what we want — the pnpm store
+#       it stores is ~1.2 GB, and the cache key already busts on a lockfile
+#       change. Restoring it takes install from ~85 s cold to ~60 s warm.
 #   Because the function owns the whole cache lifecycle internally, there are
 #   deliberately NO restore_cache / save_cache steps wrapped around it; the
 #   README calls that out explicitly and adding them would fight the function.
@@ -150,7 +61,9 @@ version: 2.1
 #   want in CI: fail loudly if the lockfile has drifted from package.json
 #   rather than silently resolving different versions than a developer gets.
 #
+# -----------------------------------------------------------------------------
 # BUILD — `pnpm build:packages`, not `pnpm build`
+# -----------------------------------------------------------------------------
 #
 #   `pnpm build` runs `turbo build` over *every* workspace, which pulls in
 #   examples/* (27 demo apps, several of them Next.js) and apps/docs. Those are
@@ -159,63 +72,126 @@ version: 2.1
 #   env — none of which exist in CI. `pnpm build:packages`
 #   (`turbo build --filter=@ai-sdk/* --filter=ai`) builds every publishable
 #   package, and those are exactly the workspaces that own a `test` script, so
-#   nothing the test step needs is missing.
+#   nothing the test steps need is missing.
 #
-# TEST — the repo's `test` task, at a lower concurrency
+#   The build keeps the repo's own `--concurrency 16`: it has completed cleanly
+#   on every run (227-308 s) and there is nothing to buy by slowing it down.
 #
-#   `pnpm test` is `turbo test --concurrency 16 --filter=!@example/*`. We run
-#   turbo directly with the same filter but `--concurrency 6`, for the memory
-#   and CPU reasons in the RESOURCE CLASS note above. The selection of what
-#   gets tested is identical to `pnpm test`.
+# -----------------------------------------------------------------------------
+# WHY TWO TEST JOBS
+# -----------------------------------------------------------------------------
 #
-#   Turbo's `test` task dependsOn `build`, and because the build step above
-#   already populated the local turbo cache inside this same job, that
-#   dependency replays from cache instead of rebuilding. That is why the test
-#   step's turbo summary reports roughly half its tasks as cached: those are
-#   the build tasks being replayed, and only the test tasks actually execute.
+#   This is the part that was arrived at empirically, so here is the evidence.
 #
-#   Deliberately not `pnpm test:ci`: that variant additionally drops the `ai`
-#   and `@ai-sdk/codemod` packages (they are split into their own job in the
-#   upstream CI). The ask here was to run the test suite, so we keep them in.
+#   Running the whole suite in one container as `pnpm test`
+#   (`turbo test --concurrency 16 --filter=!@example/*`) does not fit. Vitest
+#   sizes its own worker pool from os.availableParallelism(), which correctly
+#   reports the container's quota — the toolchain step below prints host vs
+#   container core counts (36 vs 4) so you can verify that. So the repo's
+#   default fan-out is ~16 packages in flight x 4 workers = ~64 Vitest workers
+#   sharing 4 vCPUs and 8 GB. That is tuned for a workstation, and it failed
+#   here in two distinct ways:
 #
-# SKIP_RSC_E2E=1
+#     * MEMORY. ~64 workers in 8 GB is ~128 MB each, and some suites need far
+#       more — packages/provider-utils' uint8-utils.node.test.ts deliberately
+#       spawns a subprocess to prove a 14 MB buffer encodes inside a 128 MiB
+#       heap. One run was OOM-killed outright: every test up to that point
+#       passed, and the step ended with no error output, no turbo summary, and
+#       exit code unset (CircleCI reports that as `canceled`). That is the
+#       signature to look for if this regresses.
+#     * CPU. Several suites sit within a few hundred milliseconds of Vitest's
+#       default 5 s per-test timeout, and they are import-bound rather than
+#       assertion-bound — @ai-sdk/gateway's edge run reports ~80 s of import
+#       against ~25 s of actual test time. Under contention they fail on
+#       timeout with no assertion error. Three were observed doing so:
+#         - ai              "emits declarations for exported values with
+#                            inferred output types" — imports the whole
+#                            TypeScript compiler and runs a real declaration
+#                            emit inside its 5 s budget
+#         - @ai-sdk/gateway "rejects minting (getToken) in browsers — the
+#                            credential must stay server-side"
+#         - @ai-sdk/google  "uses a resumable file upload when the creation
+#                            body reaches 20 MB"
 #
-#   @ai-sdk/rsc's `test` script chains `test:e2e:ci`, which shells out to
-#   Playwright against a real Next.js server. The repo ships this env var as
-#   the supported opt-out (packages/rsc/scripts/run-e2e-ci.mjs checks it, and
-#   turbo.json declares it on the `test` task), because browser e2e needs the
-#   `-browsers` image plus `playwright install --with-deps` and a server
-#   warm-up — a different job's worth of setup. @ai-sdk/rsc's node, edge, and
-#   React UI Vitest suites all still run. This is the one piece of the test
-#   suite this pipeline does not cover.
+#   Dropping to `--concurrency 6` (~24 workers, ~330 MB each) fixed the memory
+#   problem and cost nothing in wall-clock — it was actually slightly faster
+#   than 16, because less contention beat more parallelism. But `ai:test` then
+#   failed on the first attempt of *every* run: it is by far the largest
+#   package (183 test files) and it was being starved by the other 85.
 #
-# TURBO_TELEMETRY_DISABLED / DO_NOT_TRACK
+#   Hence the split, which mirrors what this repo already does upstream — the
+#   `test:ci` script exists precisely to exclude `ai` and `@ai-sdk/codemod`
+#   because they run as their own job there:
+#     * test-packages  — everything except `ai` and `@ai-sdk/codemod`
+#     * test-core      — `ai` and `@ai-sdk/codemod`, with the container to
+#                        themselves
+#   Verified with `turbo test --dry=json` that the two filter sets partition
+#   the suite exactly: 86 + 2 = 88 test tasks, no gaps and no overlap. The two
+#   jobs run in parallel, so splitting costs a duplicated install and build
+#   rather than wall-clock.
 #
-#   Stops turbo's first-run telemetry notice and its outbound call, so the log
-#   is just the build and the job does not depend on an unrelated endpoint.
+# -----------------------------------------------------------------------------
+# THE TEST STEP STILL RETRIES ONCE
+# -----------------------------------------------------------------------------
 #
-# no_output_timeout
+#   Kept as a safety net for the load-sensitive tests listed above, not as the
+#   mechanism that makes the suite pass — the split is what does that.
 #
-#   CircleCI kills a step after 10 minutes of silence by default. Turbo can sit
-#   quiet for longer than that while a slow package's DTS build or Vitest suite
-#   runs, so build and test get a wider window; the job would otherwise die
-#   from a healthy-but-quiet step.
+#   It is cheap because turbo caches successful `test` tasks (verified: a
+#   second invocation reports "cache hit, replaying logs"), so a retry
+#   re-executes *only* the packages that failed, which then get the container
+#   almost to themselves. It is bounded at one extra attempt deliberately: a
+#   deterministic failure fails both attempts and the job still goes red, so
+#   this absorbs contention flakes without hiding real bugs. If a test fails
+#   twice, that is signal.
 #
-# TRIGGER
+#   A retry that fires on every single run means the split has stopped doing
+#   its job and something needs rebalancing — worth checking for, since that is
+#   exactly the state this config was in before the split.
 #
-#   One workflow, no branch/tag filters, so it runs on every push to every
-#   branch.
+# -----------------------------------------------------------------------------
+# ODDS AND ENDS
+# -----------------------------------------------------------------------------
+#
+#   SKIP_RSC_E2E=1 — @ai-sdk/rsc's `test` script chains `test:e2e:ci`, which
+#   shells out to Playwright against a real Next.js server. The repo ships this
+#   env var as the supported opt-out (packages/rsc/scripts/run-e2e-ci.mjs
+#   checks it, and turbo.json declares it on the `test` task), because browser
+#   e2e needs the `-browsers` image plus `playwright install --with-deps` and a
+#   server warm-up — a different job's worth of setup. @ai-sdk/rsc's node,
+#   edge, and React UI Vitest suites all still run. This is the one part of the
+#   test suite this pipeline does not cover.
+#
+#   TURBO_TELEMETRY_DISABLED / DO_NOT_TRACK — stops turbo's first-run telemetry
+#   notice and its outbound call, so the log is just the build and the job does
+#   not depend on an unrelated endpoint.
+#
+#   no_output_timeout — CircleCI kills a step after 10 minutes of silence by
+#   default. Turbo can sit quiet for longer while a slow package's DTS build or
+#   Vitest suite runs, so build and test get a wider window; the job would
+#   otherwise die from a healthy-but-quiet step.
+#
+#   resource_class: large — `medium` (2 vCPU / 4 GB) is too small for this
+#   fan-out. `xlarge` was tried and is not available on this account's plan:
+#   the job failed in under a second with "Task information unavailable" and
+#   produced no step logs at all. If your plan does grant xlarge, raising the
+#   class is a better trade than tuning concurrency further.
+#
+#   Scaling further — if these jobs become the bottleneck, shard the packages
+#   across containers with CircleCI `parallelism` and split the turbo
+#   `--filter` per shard, rather than pushing a single container harder.
+#
+#   Not `pnpm test:ci` directly — that script hardcodes both the exclusions and
+#   `--concurrency 16`, and we need a different concurrency and the matching
+#   complement job. The task *selection* is identical to the repo's scripts.
+#
+#   TRIGGER — one workflow, no branch/tag filters, so it runs on every push to
+#   every branch.
 # =============================================================================
 
-jobs:
-  build-and-test:
-    docker:
-      - image: cimg/node:22.23.2
-    resource_class: large
-    environment:
-      SKIP_RSC_E2E: '1'
-      TURBO_TELEMETRY_DISABLED: '1'
-      DO_NOT_TRACK: '1'
+commands:
+  install-and-build:
+    description: Checkout, frozen install via circleci/setup-node, build packages.
     steps:
       - checkout
 
@@ -242,15 +218,26 @@ jobs:
           command: pnpm build:packages
           no_output_timeout: 30m
 
+  run-test-suite:
+    description: >
+      Run the turbo `test` task for the given filters, retrying once. See the
+      comment block at the top of this file for why the retry exists and why
+      the concurrency is below the repo's default of 16.
+    parameters:
+      filters:
+        description: turbo --filter arguments selecting this job's packages.
+        type: string
+      concurrency:
+        description: Max packages turbo runs at once.
+        type: string
+    steps:
       - run:
           name: Run test suite
-          # `pnpm test` is `turbo test --concurrency 16 --filter=!@example/*`;
-          # this is the same task selection with the fan-out lowered. See the
-          # RESOURCE CLASS note above for why 16 does not fit in this
-          # container, and the retry note for why this runs twice on failure.
           command: |
             run_suite() {
-              pnpm exec turbo test --concurrency 6 --filter='!@example/*'
+              pnpm exec turbo test \
+                --concurrency << parameters.concurrency >> \
+                << parameters.filters >>
             }
 
             if run_suite; then
@@ -273,7 +260,39 @@ jobs:
             run_suite
           no_output_timeout: 30m
 
+jobs:
+  # Everything except the two heavyweight packages.
+  test-packages:
+    docker:
+      - image: cimg/node:22.23.2
+    resource_class: large
+    environment:
+      SKIP_RSC_E2E: '1'
+      TURBO_TELEMETRY_DISABLED: '1'
+      DO_NOT_TRACK: '1'
+    steps:
+      - install-and-build
+      - run-test-suite:
+          filters: "--filter='!@example/*' --filter='!ai' --filter='!@ai-sdk/codemod'"
+          concurrency: '6'
+
+  # `ai` (183 test files) and `@ai-sdk/codemod`, with room to breathe.
+  test-core:
+    docker:
+      - image: cimg/node:22.23.2
+    resource_class: large
+    environment:
+      SKIP_RSC_E2E: '1'
+      TURBO_TELEMETRY_DISABLED: '1'
+      DO_NOT_TRACK: '1'
+    steps:
+      - install-and-build
+      - run-test-suite:
+          filters: "--filter='ai' --filter='@ai-sdk/codemod'"
+          concurrency: '2'
+
 workflows:
   build-and-test:
     jobs:
-      - build-and-test
+      - test-packages
+      - test-core
