@@ -99,6 +99,37 @@ version: 2.1
 #   the packages across containers with CircleCI `parallelism` and split the
 #   turbo `--filter` per shard, rather than pushing a single container harder.
 #
+# THE TEST STEP RETRIES ONCE — and why that is not just papering over it
+#
+#   Lowering the fan-out fixed the OOM but not the 5 s timeouts, and the suite
+#   that tips over is different on every run. Three distinct tests have now
+#   been observed failing on timeout alone, never on an assertion:
+#
+#     * ai              "emits declarations for exported values with inferred
+#                        output types" — imports the whole TypeScript compiler
+#                        and runs a real declaration emit inside its 5 s budget
+#     * @ai-sdk/gateway "rejects minting (getToken) in browsers — the
+#                        credential must stay server-side" — opens with a cold
+#                        dynamic `await import(...)`
+#     * @ai-sdk/google  "uses a resumable file upload when the creation body
+#                        reaches 20 MB" — allocates and JSON-encodes 20 MB
+#                        several times over
+#
+#   These are load-sensitive, not broken: each one passes comfortably when the
+#   machine is not saturated. The clean fix would be a longer `testTimeout`,
+#   but that lives in each package's Vitest config, which is a source change
+#   spread across ~80 packages rather than a CI change — and turbo gives us a
+#   cheaper equivalent. Successful `test` tasks are cached (verified: a second
+#   invocation reports "cache hit, replaying logs"), so re-running the same
+#   turbo command re-executes *only* the packages that failed, which then get
+#   the container almost to themselves and comfortably beat the 5 s budget.
+#
+#   So the step runs the suite, and on failure runs it exactly once more. This
+#   absorbs a load-induced flake without hiding a real bug: a deterministic
+#   failure fails both attempts and the step still exits non-zero. It is
+#   bounded at one extra attempt deliberately — if a test fails twice, that is
+#   signal and the job should go red.
+#
 # INSTALL — circleci/setup-node, no flags
 #
 #   Every flag this function takes is already correct by default for this repo,
@@ -214,9 +245,32 @@ jobs:
       - run:
           name: Run test suite
           # `pnpm test` is `turbo test --concurrency 16 --filter=!@example/*`;
-          # this is the same run with the fan-out lowered. See the RESOURCE
-          # CLASS note above for why 16 does not fit in this container.
-          command: pnpm exec turbo test --concurrency 6 --filter='!@example/*'
+          # this is the same task selection with the fan-out lowered. See the
+          # RESOURCE CLASS note above for why 16 does not fit in this
+          # container, and the retry note for why this runs twice on failure.
+          command: |
+            run_suite() {
+              pnpm exec turbo test --concurrency 6 --filter='!@example/*'
+            }
+
+            if run_suite; then
+              exit 0
+            fi
+
+            echo
+            echo "================================================================"
+            echo "Test suite failed. Retrying once."
+            echo
+            echo "Turbo caches successful test tasks, so this retry re-executes"
+            echo "only the packages that actually failed - they get the container"
+            echo "to themselves, which is enough for the load-sensitive suites"
+            echo "documented at the top of this config."
+            echo
+            echo "If the same test fails again below, it is a real failure."
+            echo "================================================================"
+            echo
+
+            run_suite
           no_output_timeout: 30m
 
 workflows:
